@@ -1,17 +1,20 @@
 from typing import Callable, Optional, Union, List, Dict, Any
+from diffusers.models import AutoencoderKL, UNet2DConditionModel
+from diffusers.schedulers import KarrasDiffusionSchedulers
 
 import torch
+import PIL
 import numpy as np
 
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
 from .pipeline_output import TextToVideoSDPipelineOutput
-from ..stable_diffusion import StableDiffusionPipeline
+from ..stable_diffusion import StableDiffusionImg2ImgPipeline
 from ..stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from ...models import AutoencoderKL, UNet3DConditionModel
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils.torch_utils import randn_tensor
-from ...utils import logging, replace_example_docstring
+from ...utils import PIL_INTERPOLATION, logging, replace_example_docstring
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -121,13 +124,7 @@ def get_context_params(
 
 
 def tensor2vid(video: torch.Tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -> List[np.ndarray]:
-    # This code is copied from https://github.com/modelscope/modelscope/blob/1509fdb973e5871f37148a4b5e5964cafd43e64d/modelscope/pipelines/multi_modal/text_to_video_synthesis_pipeline.py#L78
-    # reshape to ncfhw
-    mean = torch.tensor(mean, device=video.device).reshape(1, -1, 1, 1, 1)
-    std = torch.tensor(std, device=video.device).reshape(1, -1, 1, 1, 1)
-    # unnormalize back to [0,1]
-    video = video.mul_(std).add_(mean)
-    video.clamp_(0, 1)
+    # This code is modified from https://github.com/modelscope/modelscope/blob/1509fdb973e5871f37148a4b5e5964cafd43e64d/modelscope/pipelines/multi_modal/text_to_video_synthesis_pipeline.py#L78
     # prepare the final outputs
     i, c, f, h, w = video.shape
     images = video.permute(2, 3, 0, 4, 1).reshape(
@@ -138,7 +135,55 @@ def tensor2vid(video: torch.Tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -
     return images
 
 
-class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
+def preprocess_video(video, num_frames=None):
+    supported_formats = (np.ndarray, torch.Tensor, PIL.Image.Image)
+
+    if isinstance(video, supported_formats):
+        video = [video]
+    elif not (isinstance(video, list) and all(isinstance(i, supported_formats) for i in video)):
+        raise ValueError(
+            f"Input is in incorrect format: {[type(i) for i in video]}. Currently, we only support {', '.join(supported_formats)}"
+        )
+
+    if isinstance(video[0], (PIL.Image.Image, np.ndarray)):
+        w, h = video[0].size if isinstance(video[0], PIL.Image.Image) else (video[0].shape[1], video[0].shape[0])
+        w, h = (x - x % 8 for x in (w, h))  # resize to integer multiple of 8
+        video = [np.array(frame.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]) if isinstance(frame, PIL.Image.Image) else PIL.Image.fromarray(frame).resize((w, h), resample=PIL_INTERPOLATION["lanczos"])) for frame in video]
+        
+        video = np.concatenate(video, axis=0) if video[0].ndim == 5 else np.stack(video, axis=0)
+        if video.dtype == np.uint8:
+            video = np.array(video).astype(np.float32) / 255.0
+
+        if video.ndim == 4:
+            video = video[None, ...]
+
+        video = torch.from_numpy(video.transpose(0, 4, 1, 2, 3))
+
+    elif isinstance(video[0], torch.Tensor):
+        video = torch.cat(video, axis=0) if video[0].ndim == 5 else torch.stack(video, axis=0)
+
+        # don't need any preprocess if the video is latents
+        channel = video.shape[1]
+        if channel == 4:
+            return video
+
+        # move channels before num_frames
+        video = video.permute(0, 2, 1, 3, 4)
+
+    # normalize video
+    video = 2.0 * video - 1.0
+
+    # Input is an image/single frame, repeat to num_frames
+    if video.shape[2] == 1:
+        num_frames = num_frames or 16
+        video = video.repeat(1, 1, num_frames, 1, 1)
+    elif num_frames is not None and video.shape[2] != num_frames:
+        logger.warning(f"Input is a video of {video.shape[2]} frames, num_frames parameter will be ignored.")
+
+    return video
+
+
+class VideoToVideoAnimateDiffPipeline(StableDiffusionImg2ImgPipeline):
     r"""
     Pipeline for AnimateDiff text-to-video generation using Stable Diffusion.
 
@@ -165,7 +210,7 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
             A [`CLIPImageProcessor`] to extract features from generated images; used as inputs to the `safety_checker`.
     """
 
-    def __init__(self, vae: AutoencoderKL, text_encoder: CLIPTextModel, tokenizer: CLIPTokenizer, unet: UNet3DConditionModel, scheduler: KarrasDiffusionSchedulers, safety_checker: StableDiffusionSafetyChecker, feature_extractor: CLIPImageProcessor, requires_safety_checker: bool = True):
+    def __init__(self, vae: AutoencoderKL, text_encoder: CLIPTextModel, tokenizer: CLIPTokenizer, unet: UNet2DConditionModel, scheduler: KarrasDiffusionSchedulers, safety_checker: StableDiffusionSafetyChecker, feature_extractor: CLIPImageProcessor, requires_safety_checker: bool = True):
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler, safety_checker, feature_extractor, requires_safety_checker)
     
     def decode_latents(self, latents):
@@ -175,6 +220,8 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
         latents = latents.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
 
         image = self.vae.decode(latents).sample
+        image = self.image_processor.postprocess(image, output_type="pt")
+
         video = (
             image[None, :]
             .reshape(
@@ -191,29 +238,48 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
         video = video.cpu().float()
         return video
     
-    def prepare_latents(
-        self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None
-    ):
-        shape = (
-            batch_size,
-            num_channels_latents,
-            num_frames,
-            height // self.vae_scale_factor,
-            width // self.vae_scale_factor,
-        )
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
+    def prepare_latents(self, video, timestep, batch_size, dtype, device, generator=None):
+        video = video.to(device=device, dtype=dtype)
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        # change from (b, c, f, h, w) -> (b * f, c, w, h)
+        bsz, channel, frames, width, height = video.shape
+        video = video.permute(0, 2, 1, 3, 4).reshape(bsz * frames, channel, width, height)
+
+        if video.shape[1] == 4:
+            init_latents = video
         else:
-            latents = latents.to(device, dtype)
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
 
-        # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
+            elif isinstance(generator, list):
+                init_latents = [
+                    self.vae.encode(video[i : i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
+                ]
+                init_latents = torch.cat(init_latents, dim=0)
+            else:
+                init_latents = self.vae.encode(video).latent_dist.sample(generator)
+
+            init_latents = self.vae.config.scaling_factor * init_latents
+
+        if batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] != 0:
+            raise ValueError(
+                f"Cannot duplicate `video` of batch size {init_latents.shape[0]} to {batch_size} text prompts."
+            )
+        else:
+            init_latents = torch.cat([init_latents], dim=0)
+
+        shape = init_latents.shape
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+        # get latents
+        init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
+        latents = init_latents
+
+        latents = latents[None, :].reshape((bsz, frames, latents.shape[1]) + latents.shape[2:]).permute(0, 2, 1, 3, 4)
+
         return latents
     
     @torch.no_grad()
@@ -221,9 +287,9 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_frames: int = 16,
+        video: Union[List[np.ndarray], List[PIL.Image.Image], List[torch.FloatTensor], PIL.Image.Image, np.ndarray, torch.FloatTensor] = None,
+        strength: float = 0.6,
+        num_frames: int = None,
         num_images_per_prompt: Optional[int] = 1,
         num_inference_steps: int = 25,
         guidance_scale: float = 7.5,
@@ -250,13 +316,18 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
         Args:
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
-            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
-                The height in pixels of the generated video.
-            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
-                The width in pixels of the generated video.
+            video (`List[np.ndarray]` or `torch.FloatTensor`):
+                `video` frames or tensor representing a video batch to be used as the starting point for the process.
+                Can also accept video latents as `image`, if passing latents directly, it will not be encoded again.
+            strength (`float`, *optional*, defaults to 0.8):
+                Indicates extent to transform the reference `video`. Must be between 0 and 1. `video` is used as a
+                starting point, adding more noise to it the larger the `strength`. The number of denoising steps
+                depends on the amount of noise initially added. When `strength` is 1, added noise is maximum and the
+                denoising process runs for the full number of iterations specified in `num_inference_steps`. A value of
+                1 essentially ignores `video`.
             num_frames (`int`, *optional*, defaults to 16):
                 The number of video frames that are generated. Defaults to 16 frames which at 8 frames per seconds
-                amounts to 2 seconds of video.
+                amounts to 2 seconds of video. This is only applicable when the input video has only a single frame/is an image.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality videos at the
                 expense of slower inference.
@@ -309,18 +380,8 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
                 If `return_dict` is `True`, [`~pipelines.text_to_video_synthesis.TextToVideoSDPipelineOutput`] is
                 returned, otherwise a `tuple` is returned where the first element is a list with the generated frames.
         """
-        # 0. Default height and width to unet
-        height = height or self.unet.config.sample_size * self.vae_scale_factor
-        width = width or self.unet.config.sample_size * self.vae_scale_factor
-        
-        # 16 frames is max reliable number for one-shot mode, so we use sequential mode for longer videos
-        sequential_mode = num_frames is not None and num_frames > 16
-        context_frames, context_overlap, context_stride = get_context_params(num_frames, context_frames, context_overlap, context_stride)
-
         # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
-            prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
-        )
+        self.check_inputs(prompt, strength, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds)
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -331,10 +392,6 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
-        if latents_device is None:
-            latents_device = torch.device("cpu") if sequential_mode else device
-        else:
-            latents_device = torch.device(latents_device)
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
@@ -362,28 +419,38 @@ class TextToVideoAnimateDiffPipeline(StableDiffusionPipeline):
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-        # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        # 4. Preprocess video
+        video = preprocess_video(video, num_frames)
 
-        # 5. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels
+        # 16 frames is max reliable number for one-shot mode, so we use sequential mode for longer videos
+        num_frames = video.shape[2]
+        sequential_mode = num_frames is not None and num_frames > 16
+        context_frames, context_overlap, context_stride = get_context_params(num_frames, context_frames, context_overlap, context_stride)
+
+        if latents_device is None:
+            latents_device = torch.device("cpu") if sequential_mode else device
+        else:
+            latents_device = torch.device(latents_device)
+
+        # 5. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+        latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
+        # 6. Prepare latent variables
         latents = self.prepare_latents(
+            video,
+            latent_timestep,
             batch_size * num_images_per_prompt,
-            num_channels_latents,
-            num_frames,
-            height,
-            width,
             prompt_embeds.dtype,
             latents_device, # keep latents on cpu for sequential mode
-            generator,
-            latents,
+            generator
         )
 
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 6.5 - Infinite context loop shenanigans
+        # 7.5 - Infinite context loop shenanigans
         context_scheduler = uniform
         total_steps = get_total_steps(
             context_scheduler,

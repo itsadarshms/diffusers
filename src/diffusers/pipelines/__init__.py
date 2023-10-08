@@ -156,7 +156,8 @@ else:
         "TextToVideoSDPipeline",
         "TextToVideoZeroPipeline",
         "VideoToVideoSDPipeline",
-        "TextToVideoAnimateDiffPipeline"
+        "TextToVideoAnimateDiffPipeline",
+        "VideoToVideoAnimateDiffPipeline"
     ]
     _import_structure["unclip"] = ["UnCLIPImageVariationPipeline", "UnCLIPPipeline"]
     _import_structure["unidiffuser"] = [
@@ -374,7 +375,8 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             TextToVideoSDPipeline,
             TextToVideoZeroPipeline,
             VideoToVideoSDPipeline,
-            TextToVideoAnimateDiffPipeline
+            TextToVideoAnimateDiffPipeline,
+            VideoToVideoAnimateDiffPipeline
         )
         from .unclip import UnCLIPImageVariationPipeline, UnCLIPPipeline
         from .unidiffuser import (

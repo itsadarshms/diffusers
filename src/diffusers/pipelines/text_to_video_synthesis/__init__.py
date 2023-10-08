@@ -26,6 +26,7 @@ else:
     _import_structure["pipeline_text_to_video_synth_img2img"] = ["VideoToVideoSDPipeline"]
     _import_structure["pipeline_text_to_video_zero"] = ["TextToVideoZeroPipeline"]
     _import_structure["pipeline_text_to_video_animatediff"] = ["TextToVideoAnimateDiffPipeline"]
+    _import_structure["pipeline_text_to_video_animatediff_img2img"] = ["VideoToVideoAnimateDiffPipeline"]
 
 
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
@@ -40,6 +41,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .pipeline_text_to_video_synth_img2img import VideoToVideoSDPipeline
         from .pipeline_text_to_video_zero import TextToVideoZeroPipeline
         from .pipeline_text_to_video_animatediff import TextToVideoAnimateDiffPipeline
+        from .pipeline_text_to_video_animatediff_img2img import VideoToVideoAnimateDiffPipeline
 
 else:
     import sys
